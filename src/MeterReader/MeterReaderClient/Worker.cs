@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
 using Grpc.Net.Client;
 using MeterReaderWeb.Services;
 using Microsoft.Extensions.Configuration;
@@ -17,13 +18,15 @@ namespace MeterReaderClient
         private readonly ILogger<Worker> _logger;
         private readonly IConfiguration _configuration;
         private readonly ReadingFactory _factory;
+        private readonly ILoggerFactory _loggerFactory;
         private MeterReadingService.MeterReadingServiceClient _client;
 
-        public Worker(ILogger<Worker> logger, IConfiguration configuration, ReadingFactory factory)
+        public Worker(ILogger<Worker> logger, IConfiguration configuration, ReadingFactory factory, ILoggerFactory loggerFactory)
         {
             _logger = logger;
             _configuration = configuration;
             _factory = factory;
+            _loggerFactory = loggerFactory;
         }
 
         protected MeterReadingService.MeterReadingServiceClient Client
@@ -32,7 +35,12 @@ namespace MeterReaderClient
             {
                 if (_client == null)
                 {
-                    var channel = GrpcChannel.ForAddress(_configuration.GetValue<string>("Service:ServerUrl"));
+                    var opt = new GrpcChannelOptions
+                    {
+                        LoggerFactory = _loggerFactory
+                    };
+
+                    var channel = GrpcChannel.ForAddress(_configuration.GetValue<string>("Service:ServerUrl"), opt);
                     _client = new MeterReadingService.MeterReadingServiceClient(channel);
                     
                 }
@@ -44,11 +52,29 @@ namespace MeterReaderClient
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
+            var counter = 0;
+            var customerId = _configuration.GetValue<int>("Service:CustomerId");
+
+
             while (!stoppingToken.IsCancellationRequested)
             {
+                counter++;
+
+                if (counter % 10 == 0)
+                {
+                    Console.WriteLine("Sending Diagnostics");
+                    var stream = Client.SendDiagnostics();
+                    for (int i = 0; i < 5; i++)
+                    {
+                        var readingRes = await _factory.Generate(customerId);
+                        await stream.RequestStream.WriteAsync(readingRes);
+                    }
+
+                    await stream.RequestStream.CompleteAsync();
+                }
+
                 _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
 
-                var customerId = _configuration.GetValue<int>("Service:CustomerId");
 
                 var pkt = new ReadingPacket()
                 {
@@ -65,15 +91,27 @@ namespace MeterReaderClient
                 {
                     pkt.Readings.Add(await _factory.Generate(customerId));
                 }
-                var result = await Client.AddReadingAsync(pkt);
 
-                if (result.Successful == ReadingStatus.Success)
+                try
                 {
-                    _logger.LogInformation("Successfully sent");
+                    var result = await Client.AddReadingAsync(pkt);
+
+                    if (result.Successful == ReadingStatus.Success)
+                    {
+                        _logger.LogInformation("Successfully sent");
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Failed to send");
+                    }
                 }
-                else
+                catch (RpcException ex)
                 {
-                    _logger.LogInformation("Failed to send");
+                    if (ex.StatusCode == StatusCode.OutOfRange)
+                    {
+                        _logger.LogError($"{ex.Trailers}");
+                    }
+                    _logger.LogError($"Exception Thrown: {ex}");
                 }
 
                 await Task.Delay(_configuration.GetValue<int>("Service:DelayInterval"), stoppingToken);

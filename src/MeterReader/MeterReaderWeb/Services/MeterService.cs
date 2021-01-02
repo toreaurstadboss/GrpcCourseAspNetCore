@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using MeterReaderWeb.Data;
 using MeterReaderWeb.Data.Entities;
@@ -20,6 +21,20 @@ namespace MeterReaderWeb.Services
             _repository = repository;
         }
 
+        public override async Task<Empty> SendDiagnostics(IAsyncStreamReader<ReadingMessage> requestStream, ServerCallContext context)
+        {
+            var theTask = Task.Run(async () =>
+            {
+                await foreach (var reading in requestStream.ReadAllAsync())
+                {
+                    _logger.LogInformation($"Received reading: {reading}");
+                }
+            });
+
+            await theTask;
+
+            return new Empty();
+        }
 
         public override async Task<StatusMessage> AddReading(ReadingPacket request, ServerCallContext context)
         {
@@ -34,6 +49,19 @@ namespace MeterReaderWeb.Services
                 {
                     foreach (var r in request.Readings)
                     {
+
+                        if (r.ReadingValue < 1000)
+                        {
+                            _logger.LogDebug("Reading Value below acceptable level");
+                            var trailer = new Metadata
+                            {
+                                { "BadValue", r.ReadingValue.ToString() },
+                                { "Field", "ReadingValue" },
+                                { "Message", "Readings are invalid" }
+                            };
+                            throw new RpcException(Status.DefaultCancelled, trailer, "Value too low");
+                        }
+
                         //save to the database
                         var reading = new MeterReading
                         {
